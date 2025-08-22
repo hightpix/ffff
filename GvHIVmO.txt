@@ -1,0 +1,813 @@
+--[[  Border Toolkit v3.2 — MOVE-ONLY (Troop/Tank/Both + Instant)
+     • J = start/stop continuous march loop
+     • WhereToAttack tool (Shift = multi) — cannot select your own provinces
+     • Unit filter: Troop / Tank / Both
+     • Speed toggle: Normal ↔ Instant (bursts first move so it starts right away)
+     • Radar restored (enemy dots colored by province), Auto + FlipY
+     • Straight-line march; optional Avoid; Def+ (blocker every 15s)
+     • Multi-select ⇒ closest free unit takes each province
+     • Robust capture checks (Unit.Province OR raycast OR my-color surface)
+     • NO spawn/disband code — moves current units only.
+     • No yellow selection highlight (removed per request).
+--]]
+
+------------------------
+-- Services / Remotes --
+------------------------
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local UserInput = game:GetService('UserInputService')
+local Rep = game:GetService('ReplicatedStorage')
+local StarterGui = game:GetService('StarterGui')
+local LP = Players.LocalPlayer
+
+local MoveTroopRE = Rep:WaitForChild('MoveTroop')
+
+----------------
+-- Parameters --
+----------------
+local CFG = {
+	tick = 0.14,
+	moveCooldown = 0.25,
+
+	-- Instant mode
+	instant = false,
+	instantTick = 0.06,
+	instantCooldown = 0.04,
+	instantBurst = 3,
+	instantBurstSpread = 2.0,
+
+	-- path/avoidance
+	blockRadiusTroop = 18,
+	blockRadiusTank  = 26,
+	avoidSearchRadius = 240,
+	avoidAngleMax = math.rad(85),
+	bigProvEdge = 100,
+	maxReassignEvery = 0.8,
+
+	-- defense+
+	defenseEnabled = false,
+	defensePeriod = 15,
+	defenseGroupDist = 45,
+	defenseMinGroup = 3,
+
+	-- UI
+	barY = 6,
+	barH = 28,
+	radarSize = Vector2.new(290, 180),
+	radarAutoPeriod = 1.1,
+
+	-- ray budgets
+	marchRaysPerTick = 40,
+
+	debug = false,
+}
+
+-------------
+-- State  ---
+-------------
+local MyCountryModel, MyUnitsFolder, MyColorNumber = nil, nil, nil
+local UnitType = 'Both' -- 'Troop' | 'Tank' | 'Both'
+local MarchOn, AvoidOn, DefPlusOn = false, true, false
+
+local Selected, SelectedSet = {}, {}
+local Assignments, LastMoveTime, ReservedProv = {}, {}, {}
+local LastAssignedAt, LastDefenseAt = 0, 0
+
+local TargetColorKeys, ColorKeyToColor = {}, {}
+
+-- UI
+local GUI, Bar, ButtonRefs = nil, nil, {}
+local Radar, RadarCanvas = nil, nil
+local RadarAuto, FlipY = false, false
+local ColorWinFrame, ColorScroll = nil, nil
+
+-----------------
+-- Utilities  ---
+-----------------
+local function log(...) if CFG.debug then print('[BORDER]', ...) end end
+local function toast(msg) pcall(function()
+	StarterGui:SetCore('SendNotification', {Title='Border', Text=tostring(msg), Duration=3})
+end) end
+local function now() return os.clock() end
+local function colorKey(c) return string.format('rgb(%.3f,%.3f,%.3f)', c.R, c.G, c.B) end
+local function getMapFolder() return workspace:FindFirstChild('Map') or workspace end
+local function isProvince(inst) return inst and inst:IsA('BasePart') and inst.Name == 'Province' end
+
+local function toVectorArg(v3)
+	local mod = Rep:FindFirstChild('vector')
+	if mod and mod:IsA('ModuleScript') then
+		local ok, vec = pcall(require, mod)
+		if ok and vec and type(vec.create) == 'function' then
+			return vec.create(v3.X, v3.Y, v3.Z)
+		end
+	end
+	return v3
+end
+
+local function allProvinces()
+	local t = {}
+	for _, p in ipairs(getMapFolder():GetChildren()) do
+		if isProvince(p) then t[#t+1] = p end
+	end
+	return t
+end
+
+local function unitPrimary(model) return model and model:FindFirstChild('HumanoidRootPart') end
+
+local function myCountry()
+	local Countries = workspace:FindFirstChild('Countries')
+	if not Countries then return nil end
+	for _, c in ipairs(Countries:GetChildren()) do
+		local leader = c:FindFirstChild('Leader')
+		if leader and leader.Value == Players.LocalPlayer then return c end
+		local members = c:FindFirstChild('Members')
+		if members and members:FindFirstChild(Players.LocalPlayer.Name) then return c end
+	end
+	return nil
+end
+
+local function detectMyColor()
+	if not MyUnitsFolder then return nil end
+	local counts, sample = {}, 0
+	for _, m in ipairs(MyUnitsFolder:GetChildren()) do
+		local hrp = unitPrimary(m)
+		if hrp then
+			local rp = RaycastParams.new()
+			rp.FilterType = Enum.RaycastFilterType.Whitelist
+			rp.FilterDescendantsInstances = {getMapFolder()}
+			local rc = workspace:Raycast(hrp.Position + Vector3.new(0,60,0), Vector3.new(0,-200,0), rp)
+			if rc and rc.Instance and rc.Instance.BrickColor then
+				local num = rc.Instance.BrickColor.Number
+				counts[num] = (counts[num] or 0) + 1
+				sample += 1
+			end
+			if sample >= 6 then break end
+		end
+	end
+	local best, bestN = nil, 0
+	for n, c in pairs(counts) do if c > bestN then best, bestN = n, c end end
+	return best
+end
+
+local function refreshMyCountry()
+	MyCountryModel = myCountry()
+	if not MyCountryModel then MyUnitsFolder, MyColorNumber = nil, nil; return end
+	MyUnitsFolder = MyCountryModel:FindFirstChild('Units')
+	MyColorNumber = detectMyColor()
+end
+refreshMyCountry()
+
+local function partCenter(p) return p.CFrame.Position end
+local function dist(a,b) return (a-b).Magnitude end
+
+-- march ray budget
+local marchBudget = 0
+local function resetMarchBudget() marchBudget = CFG.marchRaysPerTick end
+local function raycastWhitelist(inst, origin, dir)
+	if marchBudget <= 0 then return nil end
+	marchBudget -= 1
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Whitelist
+	rp.FilterDescendantsInstances = {inst}
+	return workspace:Raycast(origin, dir, rp)
+end
+
+local function groundOnProvinceSurface(p)
+	local cf, sz = p.CFrame, p.Size
+	for _ = 1, 16 do
+		local ox = (math.random()-0.5)*sz.X*0.85
+		local oz = (math.random()-0.5)*sz.Z*0.85
+		local from = cf.Position + Vector3.new(ox, sz.Y*0.5 + 60, oz)
+		local rc = raycastWhitelist(getMapFolder(), from, Vector3.new(0, -(sz.Y+220), 0))
+		if rc and rc.Instance == p then
+			return rc.Position + Vector3.new(0,0.2,0)
+		end
+	end
+	return p.Position + Vector3.new(0,0.2,0)
+end
+
+local function myUnits(filterName)
+	local out = {}
+	if not MyUnitsFolder then return out end
+	for _, m in ipairs(MyUnitsFolder:GetChildren()) do
+		if m:IsA('Model') and unitPrimary(m) then
+			if (not filterName) or filterName == 'Both' or m.Name == filterName then
+				out[#out+1] = m
+			end
+		end
+	end
+	return out
+end
+
+--------------------------------
+-- Selection & Color targeting --
+--------------------------------
+local function toggleSelect(p, multi)
+	if not (p and isProvince(p)) then return end
+	if MyColorNumber and p.BrickColor and p.BrickColor.Number == MyColorNumber then
+		toast('Skipping (looks like your own province).'); return
+	end
+	if SelectedSet[p] then
+		SelectedSet[p] = nil
+		for i,x in ipairs(Selected) do if x == p then table.remove(Selected,i) break end end
+	else
+		if not multi then
+			for k in pairs(SelectedSet) do SelectedSet[k] = nil end
+			table.clear(Selected)
+		end
+		SelectedSet[p] = true
+		table.insert(Selected, p)
+	end
+end
+
+-----------------------
+-- Radar (restored)  --
+-----------------------
+local mapBounds = {minX=0,maxX=0,minZ=0,maxZ=0,ready=false}
+local dotsPool, usedDots = {}, 0
+local function freeDots() for i=1,usedDots do dotsPool[i].Visible=false end usedDots=0 end
+local function getDot()
+	usedDots += 1
+	if not dotsPool[usedDots] then
+		local d = Instance.new('Frame')
+		d.Size = UDim2.fromOffset(2,2); d.BorderSizePixel=0; d.Parent = RadarCanvas
+		dotsPool[usedDots] = d
+	end
+	local d = dotsPool[usedDots]; d.Visible=true; return d
+end
+local function rebuildBounds()
+	local first = true
+	for _,p in ipairs(allProvinces()) do
+		local pos, half = p.Position, p.Size/2
+		local minX,maxX = pos.X-half.X, pos.X+half.X
+		local minZ,maxZ = pos.Z-half.Z, pos.Z+half.Z
+		if first then
+			mapBounds.minX,mapBounds.maxX,mapBounds.minZ,mapBounds.maxZ = minX,maxX,minZ,maxZ
+			first=false
+		else
+			if minX<mapBounds.minX then mapBounds.minX=minX end
+			if maxX>mapBounds.maxX then mapBounds.maxX=maxX end
+			if minZ<mapBounds.minZ then mapBounds.minZ=minZ end
+			if maxZ>mapBounds.maxZ then mapBounds.maxZ=maxZ end
+		end
+	end
+	mapBounds.ready = not first
+end
+local function proj(x,z)
+	if not mapBounds.ready then rebuildBounds() end
+	local rx = (x-mapBounds.minX)/math.max(1e-3, mapBounds.maxX-mapBounds.minX)
+	local rz = (z-mapBounds.minZ)/math.max(1e-3, mapBounds.maxZ-mapBounds.minZ)
+	if FlipY then rz = 1-rz end
+	return rx*CFG.radarSize.X, rz*CFG.radarSize.Y
+end
+local function nearestProvinceColor(pos)
+	local rp = RaycastParams.new(); rp.FilterType=Enum.RaycastFilterType.Whitelist
+	rp.FilterDescendantsInstances = {getMapFolder()}
+	local rc = workspace:Raycast(pos + Vector3.new(0,120,0), Vector3.new(0,-300,0), rp)
+	if rc and rc.Instance and isProvince(rc.Instance) then return rc.Instance.Color end
+	return Color3.fromRGB(220,220,220)
+end
+
+-----------------------
+-- Enemy perception  --
+-----------------------
+local function enemyUnits()
+	local out = {}
+	local Countries = workspace:FindFirstChild('Countries')
+	if not Countries then return out end
+	for _, c in ipairs(Countries:GetChildren()) do
+		if c ~= MyCountryModel then
+			local units = c:FindFirstChild('Units')
+			if units then
+				for _, m in ipairs(units:GetChildren()) do
+					local hrp = unitPrimary(m)
+					if hrp then
+						out[#out+1] = {pos=hrp.Position, kind=m.Name}
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- distance from point P to segment AB
+local function distPointToSegment(p, a, b)
+	local ab = b - a
+	local t = ((p - a):Dot(ab)) / math.max(ab:Dot(ab), 1e-6)
+	t = math.clamp(t, 0, 1)
+	local projP = a + ab * t
+	return (p - projP).Magnitude, t
+end
+
+local function pathBlocked(unitPos, targetPos, enemies)
+	if not AvoidOn then return false end
+	local ahead = (targetPos - unitPos).Unit
+	for _, e in ipairs(enemies) do
+		local r = (e.kind == 'Tank') and CFG.blockRadiusTank or CFG.blockRadiusTroop
+		local d,t = distPointToSegment(e.pos, unitPos, targetPos)
+		if t > 0.05 and d <= r and (e.pos - unitPos):Dot(ahead) > 0 then
+			return true
+		end
+	end
+	return false
+end
+
+-----------------------
+-- Targets / Assign  --
+-----------------------
+local function rebuildColorList()
+	if not ColorScroll then return end
+	ColorScroll:ClearAllChildren()
+	local counts, seen = {}, {}
+	for _, p in ipairs(allProvinces()) do
+		if not (MyColorNumber and p.BrickColor.Number == MyColorNumber) then
+			local k = colorKey(p.Color); counts[k] = (counts[k] or 0) + 1; seen[k] = p.Color
+		end
+	end
+	local arr = {}
+	for k,c in pairs(seen) do arr[#arr+1] = {k=k,c=c,n=counts[k]} end
+	table.sort(arr, function(a,b) return a.n > b.n end)
+	local y = 0
+	for _, e in ipairs(arr) do
+		local row = Instance.new('TextButton')
+		row.Size = UDim2.new(1,-6,0,26); row.Position = UDim2.fromOffset(3,y)
+		row.BackgroundColor3 = Color3.fromRGB(40,40,40); row.Text = ('x%d'):format(e.n)
+		row.Font = Enum.Font.GothamSemibold; row.TextSize = 14; row.TextColor3 = Color3.new(1,1,1)
+		row.Parent = ColorScroll; y = y + 28
+
+		local sw = Instance.new('Frame'); sw.Size = UDim2.fromOffset(46,18); sw.Position = UDim2.fromOffset(6,4)
+		sw.BackgroundColor3 = e.c; sw.BorderSizePixel = 0; sw.Parent = row
+
+		local tick = Instance.new('TextLabel'); tick.Size = UDim2.fromOffset(22,18); tick.Position = UDim2.new(1,-26,0,4)
+		tick.BackgroundTransparency = 1; tick.Text = ''; tick.TextColor3 = Color3.fromRGB(120,255,120)
+		tick.Font = Enum.Font.GothamBold; tick.TextSize = 18; tick.Parent = row
+
+		local function refresh() tick.Text = TargetColorKeys[e.k] and '✓' or '' end
+		refresh()
+		row.MouseButton1Click:Connect(function()
+			TargetColorKeys[e.k] = TargetColorKeys[e.k] and nil or true
+			refresh()
+		end)
+		ColorKeyToColor[e.k] = e.c
+	end
+	ColorScroll.CanvasSize = UDim2.new(0,0,0, math.max(y, ColorScroll.AbsoluteWindowSize.Y))
+end
+
+local function buildTargetList()
+	if #Selected > 0 then
+		local t = {}
+		for _, p in ipairs(Selected) do if p and p.Parent then t[#t+1] = p end end
+		return t
+	end
+	if next(TargetColorKeys) ~= nil then
+		local t = {}
+		for _, p in ipairs(allProvinces()) do
+			if not (MyColorNumber and p.BrickColor.Number == MyColorNumber) then
+				if TargetColorKeys[colorKey(p.Color)] then t[#t+1] = p end
+			end
+		end
+		return t
+	end
+	local t = {}
+	for _, p in ipairs(allProvinces()) do
+		if not (MyColorNumber and p.BrickColor.Number == MyColorNumber) then t[#t+1] = p end
+	end
+	return t
+end
+
+local function provinceCaptured(unit, prov)
+	if not unit or not prov then return false end
+	local ov = unit:FindFirstChild('Province')
+	if ov and ov.Value == prov then return true end
+	local hrp = unitPrimary(unit); if not hrp then return false end
+	local rc = raycastWhitelist(getMapFolder(), hrp.Position + Vector3.new(0,60,0), Vector3.new(0,-140,0))
+	if rc and rc.Instance then
+		if rc.Instance == prov then return true end
+		if MyColorNumber and rc.Instance.BrickColor and rc.Instance.BrickColor.Number == MyColorNumber then
+			return true
+		end
+	end
+	return false
+end
+
+local function clearDeadAssignments()
+	for unit, prov in pairs(Assignments) do
+		if (not unit) or (not unit.Parent) or (not prov) or (not prov.Parent) then
+			Assignments[unit] = nil
+			if prov then ReservedProv[prov] = nil end
+		end
+	end
+end
+
+local function chooseAlternate(unitPos, target, allT, enemies)
+	if math.max(target.Size.X, target.Size.Z) >= CFG.bigProvEdge then return target end
+	local best, bestScore
+	local toT = (partCenter(target) - unitPos)
+	local distT = toT.Magnitude
+	local heading = toT.Unit
+	for _, p in ipairs(allT) do
+		if p ~= target and p.Parent and not ReservedProv[p] then
+			local dp = partCenter(p)
+			if (dp - partCenter(target)).Magnitude <= CFG.avoidSearchRadius then
+				local v = (dp - unitPos); local ang = math.acos(math.clamp(v.Unit:Dot(heading), -1, 1))
+				if ang <= CFG.avoidAngleMax then
+					local blocked = pathBlocked(unitPos, dp, enemies)
+					if not blocked then
+						local score = math.abs(v.Magnitude - distT) + ang*20 + (p.Size.X*p.Size.Z)/1500
+						if (not best) or score < bestScore then best, bestScore = p, score end
+					end
+				end
+			end
+		end
+	end
+	return best or target
+end
+
+local function sendMove(unit, pos, burst)
+	MoveTroopRE:FireServer(unit, toVectorArg(pos))
+	if burst and CFG.instant and CFG.instantBurst > 1 then
+		for _ = 1, CFG.instantBurst-1 do
+			local jx = (math.random()-0.5)*CFG.instantBurstSpread
+			local jz = (math.random()-0.5)*CFG.instantBurstSpread
+			MoveTroopRE:FireServer(unit, toVectorArg(pos + Vector3.new(jx, 0, jz)))
+		end
+	end
+end
+
+local function rebuildAssignments()
+	if now() - LastAssignedAt < CFG.maxReassignEvery then return end
+	LastAssignedAt = now()
+
+	clearDeadAssignments()
+	for unit, prov in pairs(Assignments) do
+		if provinceCaptured(unit, prov) then
+			Assignments[unit] = nil
+			ReservedProv[prov] = nil
+		end
+	end
+
+	local targets = buildTargetList()
+	if #targets == 0 then return end
+	local enemies = enemyUnits()
+
+	local used = {}
+	for _, unit in ipairs(myUnits(UnitType)) do
+		if unit and unit.Parent and not Assignments[unit] then
+			local hrp = unitPrimary(unit)
+			if hrp then
+				local best, bestD
+				for _, p in ipairs(targets) do
+					if p and p.Parent and not used[p] and not ReservedProv[p] then
+						local d = dist(hrp.Position, partCenter(p))
+						if (not best) or d < bestD then best, bestD = p, d end
+					end
+				end
+				if best then
+					local tgt = best
+					if AvoidOn and pathBlocked(hrp.Position, partCenter(best), enemies) then
+						tgt = chooseAlternate(hrp.Position, best, targets, enemies)
+					end
+					Assignments[unit] = tgt
+					used[tgt] = true
+					ReservedProv[tgt] = true
+
+					local kickPos = groundOnProvinceSurface(tgt)
+					sendMove(unit, kickPos, true)
+					LastMoveTime[unit] = now()
+				end
+			end
+		end
+	end
+end
+
+local function moveTowardAssignments()
+	for unit, prov in pairs(Assignments) do
+		if not unit or not prov or not unit.Parent or not prov.Parent then
+			Assignments[unit] = nil; if prov then ReservedProv[prov] = nil end
+		elseif provinceCaptured(unit, prov) then
+			Assignments[unit] = nil; ReservedProv[prov] = nil
+		else
+			local t0 = LastMoveTime[unit] or 0
+			if now() - t0 >= (CFG.instant and CFG.instantCooldown or CFG.moveCooldown) then
+				LastMoveTime[unit] = now()
+				local pos = groundOnProvinceSurface(prov)
+				sendMove(unit, pos, false)
+			end
+		end
+	end
+end
+
+----------------
+-- Defense +  --
+----------------
+local function clusterEnemies(points)
+	local clusters = {}
+	for _, p in ipairs(points) do
+		local assigned = false
+		for _, cl in ipairs(clusters) do
+			if (p.pos - cl.center).Magnitude <= CFG.defenseGroupDist then
+				cl.sum = cl.sum + p.pos; cl.n += 1; cl.center = cl.sum / cl.n
+				assigned = true; break
+			end
+		end
+		if not assigned then
+			table.insert(clusters, {sum=p.pos, n=1, center=p.pos})
+		end
+	end
+	return clusters
+end
+
+local function nearestEnemyProvince(pos)
+	local best, bestD
+	for _, p in ipairs(allProvinces()) do
+		if not (MyColorNumber and p.BrickColor.Number == MyColorNumber) then
+			local d = dist(pos, partCenter(p))
+			if (not best) or d < bestD then best, bestD = p, d end
+		end
+	end
+	return best
+end
+
+local function defenseTick()
+	if not DefPlusOn then return end
+	if now() - LastDefenseAt < CFG.defensePeriod then return end
+	LastDefenseAt = now()
+
+	local enemies = enemyUnits()
+	local clusters = clusterEnemies(enemies)
+	for _, cl in ipairs(clusters) do
+		if cl.n >= CFG.defenseMinGroup then
+			local intercept = nearestEnemyProvince(cl.center)
+			if intercept and intercept.Parent then
+				local bestU, bestD
+				for _, u in ipairs(myUnits('Troop')) do
+					if not Assignments[u] then
+						local hrp = unitPrimary(u)
+						if hrp then
+							local d = dist(hrp.Position, partCenter(intercept))
+							if (not bestU) or d < bestD then bestU, bestD = u, d end
+						end
+					end
+				end
+				if bestU then
+					Assignments[bestU] = intercept
+					ReservedProv[intercept] = true
+					sendMove(bestU, groundOnProvinceSurface(intercept), true)
+					LastMoveTime[bestU] = now()
+				end
+			end
+		end
+	end
+end
+
+-----------------------
+-- March step & loop --
+-----------------------
+local function marchStep()
+	marchBudget = CFG.marchRaysPerTick
+	rebuildAssignments()
+	defenseTick()
+	moveTowardAssignments()
+end
+
+-----------------------
+-- GUI / Controls    --
+-----------------------
+local function ensureGUI()
+	if GUI then return end
+	GUI = Instance.new('ScreenGui')
+	GUI.Name = 'BorderToolkit_MoveOnly'
+	GUI.IgnoreGuiInset = true
+	GUI.ResetOnSpawn = false
+	GUI.Parent = LP:WaitForChild('PlayerGui')
+
+	Bar = Instance.new('Frame')
+	Bar.BackgroundColor3 = Color3.fromRGB(15,15,15)
+	Bar.BackgroundTransparency = 0.25
+	Bar.Size = UDim2.new(1,-8,0,CFG.barH)
+	Bar.Position = UDim2.new(0,4,0,CFG.barY)
+	Bar.Parent = GUI
+
+	local function mkBtn(name, label, cb)
+		local b = Instance.new('TextButton')
+		b.Name = name; b.Text = label
+		b.Font = Enum.Font.GothamSemibold; b.TextSize = 14
+		b.BackgroundColor3 = Color3.fromRGB(38,38,38)
+		b.TextColor3 = Color3.fromRGB(235,235,235)
+		b.Size = UDim2.new(0,118,1,0)
+		b.Parent = Bar
+		b.MouseButton1Click:Connect(function() if cb then cb() end end)
+		ButtonRefs[name] = b; return b
+	end
+
+	local x = 4
+	local function place(b) b.Position = UDim2.new(0,x,0,0); x = x + b.AbsoluteSize.X + 6 end
+
+	place(mkBtn('Auto', 'Auto: OFF', function()
+		MarchOn = not MarchOn
+		ButtonRefs.Auto.Text = MarchOn and 'Auto: ON' or 'Auto: OFF'
+		toast('Auto march: '..(MarchOn and 'ON' or 'OFF'))
+		if MarchOn then marchStep() end
+	end))
+
+	place(mkBtn('Unit', 'Unit: '..UnitType, function()
+		if UnitType=='Troop' then UnitType='Tank'
+		elseif UnitType=='Tank' then UnitType='Both'
+		else UnitType='Troop' end
+		ButtonRefs.Unit.Text = 'Unit: '..UnitType
+	end))
+
+	place(mkBtn('Speed', 'Speed: Normal', function()
+		CFG.instant = not CFG.instant
+		if CFG.instant then
+			CFG.tick = CFG.instantTick
+			CFG.moveCooldown = CFG.instantCooldown
+			ButtonRefs.Speed.Text = 'Speed: Instant'
+			toast('Instant movement ON')
+		else
+			CFG.tick = 0.14
+			CFG.moveCooldown = 0.25
+			ButtonRefs.Speed.Text = 'Speed: Normal'
+			toast('Instant movement OFF')
+		end
+	end))
+
+	place(mkBtn('Avoid', 'Avoid: ON', function()
+		AvoidOn = not AvoidOn
+		ButtonRefs.Avoid.Text = AvoidOn and 'Avoid: ON' or 'Avoid: OFF'
+	end))
+
+	place(mkBtn('Def', 'Def+: OFF', function()
+		DefPlusOn = not DefPlusOn
+		ButtonRefs.Def.Text = DefPlusOn and 'Def+: ON' or 'Def+: OFF'
+	end))
+
+	place(mkBtn('Colors', 'Colors', function()
+		if ColorWinFrame then ColorWinFrame.Visible = not ColorWinFrame.Visible end
+		if ColorWinFrame and ColorWinFrame.Visible then rebuildColorList() end
+	end))
+
+	place(mkBtn('Clear', 'Clear', function()
+		for k in pairs(SelectedSet) do SelectedSet[k]=nil end
+		table.clear(Selected)
+		for u,_ in pairs(Assignments) do Assignments[u]=nil end
+		table.clear(ReservedProv)
+		toast('Cleared selections/assignments')
+	end))
+end
+
+local function ensureColorWin()
+	if ColorWinFrame then return end
+	ColorWinFrame = Instance.new('Frame')
+	ColorWinFrame.Name='ColorPicker'
+	ColorWinFrame.BackgroundColor3=Color3.fromRGB(18,18,18)
+	ColorWinFrame.BackgroundTransparency=0.1
+	ColorWinFrame.BorderSizePixel=0
+	ColorWinFrame.Visible=false
+	ColorWinFrame.Position = UDim2.new(0,8,0, CFG.barY + CFG.barH + 8)
+	ColorWinFrame.Size = UDim2.new(0,340,0,240)
+	ColorWinFrame.Parent = GUI
+
+	local Title = Instance.new('TextLabel'); Title.Text='Target Colors (click to toggle)'
+	Title.Font=Enum.Font.GothamBold; Title.TextSize=16; Title.TextColor3=Color3.new(1,1,1)
+	Title.BackgroundTransparency=1; Title.Size=UDim2.new(1,-8,0,24); Title.Position=UDim2.fromOffset(8,6); Title.Parent=ColorWinFrame
+
+	ColorScroll = Instance.new('ScrollingFrame'); ColorScroll.BackgroundTransparency=1
+	ColorScroll.Size=UDim2.new(1,-16,1,-70); ColorScroll.Position=UDim2.fromOffset(8,36)
+	ColorScroll.CanvasSize=UDim2.new(); ColorScroll.ScrollBarThickness=5; ColorScroll.Parent=ColorWinFrame
+
+	local footer=Instance.new('Frame'); footer.BackgroundTransparency=1
+	footer.Size=UDim2.new(1,-16,0,28); footer.Position=UDim2.new(0,8,1,-32); footer.Parent=ColorWinFrame
+
+	local function mkSmall(txt,x,cb)
+		local b=Instance.new('TextButton'); b.Text=txt; b.Font=Enum.Font.GothamSemibold; b.TextSize=14
+		b.TextColor3=Color3.new(1,1,1); b.BackgroundColor3=Color3.fromRGB(45,45,45)
+		b.Size=UDim2.fromOffset(100,24); b.Position=UDim2.fromOffset(x,2); b.Parent=footer
+		b.MouseButton1Click:Connect(cb)
+	end
+	mkSmall('Refresh',0,function() rebuildColorList() end)
+	mkSmall('Clear',110,function() for k in pairs(TargetColorKeys) do TargetColorKeys[k]=nil end; rebuildColorList() end)
+end
+
+local function buildRadar()
+	Radar = Instance.new('Frame'); Radar.Name='FrontlineRadar'
+	Radar.Size=UDim2.fromOffset(CFG.radarSize.X+10, CFG.radarSize.Y+36)
+	Radar.Position=UDim2.new(1, -(CFG.radarSize.X+18), 0, CFG.barY + CFG.barH + 8)
+	Radar.BackgroundColor3=Color3.fromRGB(18,18,18); Radar.BorderSizePixel=0; Radar.Parent = GUI
+
+	RadarCanvas = Instance.new('Frame'); RadarCanvas.Size=UDim2.fromOffset(CFG.radarSize.X, CFG.radarSize.Y)
+	RadarCanvas.Position=UDim2.fromOffset(5,5); RadarCanvas.BackgroundColor3=Color3.fromRGB(30,30,30)
+	RadarCanvas.BorderSizePixel=0; RadarCanvas.Parent=Radar
+
+	local btns = Instance.new('Frame'); btns.Size=UDim2.new(1,-10,0,24)
+	btns.Position=UDim2.fromOffset(5, CFG.radarSize.Y+8); btns.BackgroundTransparency=1; btns.Parent=Radar
+	local function mk(txt,x,cb)
+		local b=Instance.new('TextButton'); b.Text=txt; b.Font=Enum.Font.GothamSemibold; b.TextSize=13
+		b.TextColor3=Color3.new(1,1,1); b.BackgroundColor3=Color3.fromRGB(45,45,45)
+		b.Size=UDim2.fromOffset(80,22); b.Position=UDim2.fromOffset(x,0); b.Parent=btns
+		b.MouseButton1Click:Connect(cb); return b
+	end
+	local refreshBtn = mk('Refresh',0,function()
+		for i=1,usedDots do dotsPool[i].Visible=false end; usedDots=0
+		rebuildBounds()
+		local Countries=workspace:FindFirstChild('Countries')
+		if Countries then
+			for _,country in ipairs(Countries:GetChildren()) do
+				local units=country:FindFirstChild('Units')
+				if units then
+					for _,m in ipairs(units:GetChildren()) do
+						local hrp=unitPrimary(m)
+						if hrp then
+							local px,py = proj(hrp.Position.X, hrp.Position.Z)
+							local d=getDot(); d.Position=UDim2.fromOffset(math.floor(px+0.5), math.floor(py+0.5))
+							d.BackgroundColor3 = nearestProvinceColor(hrp.Position)
+						end
+					end
+				end
+			end
+		end
+	end)
+	local autoBtn = mk('Auto: OFF',86,function() RadarAuto=not RadarAuto; autoBtn.Text=RadarAuto and 'Auto: ON' or 'Auto: OFF' end)
+	mk('FlipY',172,function() FlipY=not FlipY; refreshBtn:Activate() end)
+	mk('Close',258,function() Radar.Visible=false end)
+
+	task.spawn(function()
+		while Radar and Radar.Parent do
+			if RadarAuto then refreshBtn:Activate() end
+			task.wait(CFG.radarAutoPeriod)
+		end
+	end)
+	refreshBtn:Activate()
+end
+
+-----------------------
+-- Tool & Keybinds   --
+-----------------------
+local function ensureTool()
+	local bp = LP:WaitForChild('Backpack')
+	if not bp:FindFirstChild('WhereToAttack') then
+		local tool = Instance.new('Tool')
+		tool.Name='WhereToAttack'; tool.RequiresHandle=false; tool.CanBeDropped=false; tool.Parent=bp
+		tool.Activated:Connect(function()
+			local m=LP:GetMouse()
+			toggleSelect(
+				m.Target,
+				UserInput:IsKeyDown(Enum.KeyCode.LeftShift) or UserInput:IsKeyDown(Enum.KeyCode.RightShift)
+			)
+		end)
+	end
+end
+
+UserInput.InputBegan:Connect(function(input, gpe)
+	if gpe or UserInput:GetFocusedTextBox() then return end
+	if input.KeyCode == Enum.KeyCode.J then
+		MarchOn = not MarchOn
+		if ButtonRefs.Auto then ButtonRefs.Auto.Text = MarchOn and 'Auto: ON' or 'Auto: OFF' end
+		toast('Auto march: '..(MarchOn and 'ON' or 'OFF'))
+		if MarchOn then marchStep() end
+	elseif input.KeyCode == Enum.KeyCode.C then
+		for k in pairs(SelectedSet) do SelectedSet[k]=nil end
+		table.clear(Selected)
+		for u,_ in pairs(Assignments) do Assignments[u]=nil end
+		table.clear(ReservedProv)
+		toast('Cleared selections')
+	end
+end)
+
+-----------------------
+-- Boot / Main loop  --
+-----------------------
+local function boot()
+	-- UI
+	GUI = nil; ensureGUI()
+	ColorWinFrame = nil; ensureColorWin()
+	buildRadar()
+	ensureTool()
+
+	-- try to bind country/units
+	if not MyCountryModel then
+		task.spawn(function()
+			for _=1,120 do
+				refreshMyCountry()
+				if MyCountryModel and MyUnitsFolder then break end
+				task.wait(0.5)
+			end
+		end)
+	end
+
+	-- march loop
+	local acc = 0
+	RunService.Heartbeat:Connect(function(dt)
+		if not MarchOn then return end
+		acc += dt
+		if acc >= CFG.tick then
+			acc = 0
+			marchStep()
+		end
+	end)
+end
+
+boot()
+toast('Move-only loaded. Select provinces (Shift=multi), choose Unit = Troop/Tank/Both, press J to march. Use Speed for Instant.')
